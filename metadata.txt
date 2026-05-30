@@ -1,0 +1,50 @@
+[general]
+name=QGIS Doctor
+qgisMinimumVersion=3.16
+qgisMaximumVersion=4.99
+description=Diagnose QGIS project issues or bugs, and get AI-guided solutions
+version=1.1.1
+author=Francesco Panzetti
+email=francesco.panzetti@gmail.com
+about=QGIS Doctor helps you understand why your project isn't working as expected —
+ even when you're not sure what went wrong or where to look.
+
+ When something feels off — layers misaligned, tools behaving strangely,
+ settings that don't seem to do anything — the cause is rarely obvious.
+ It could be a configuration mistake you made without realizing it, a conflict
+ between settings, a broken data source, or a known bug in QGIS itself.
+
+ QGIS Doctor inspects your live QGIS environment — not just the project file,
+ but the actual state of the program as it's running — and gives you a plain-language
+ report of what it finds, sorted by severity and type.
+
+ For each issue, it tells you whether the problem is something you can fix yourself
+ right now, a known bug already reported to the QGIS developers, or something that
+ may not have been seen before.
+
+ Optionally, connect your preferred AI assistant (Claude, ChatGPT, Gemini or any
+ OpenAI-compatible model) via API key. The full context of your QGIS environment
+ is sent to the AI, which can then walk you through a solution step by step,
+ tailored to your exact situation.
+
+ No AI key? Use the Copy for AI button to paste your report into any chatbot manually.
+tags=diagnostics,debugging,project,health,ai,configuration,errors,quality
+homepage=
+tracker=
+repository=
+category=Plugins
+icon=icons/icon.svg
+hasProcessingProvider=no
+supportsQt6=False
+experimental=False
+deprecated=False
+changelog=
+    1.1.0 - Full implementation: all diagnostic modules (49 rules across CRS, Layer, Join,
+             Plugin, Digitizing, Rendering, Expressions, Print Layout, Project, Log),
+             LLM integration (Anthropic/OpenAI/Google/Custom), knowledge lookup
+             (GitHub + StackExchange), bug reporter, auto-fix for LAY-11,
+             Settings dialog (AI Connection + Behaviour tabs), per-module progress,
+             enhanced CRS diagnostics for Italy (Monte Mario/Gauss-Boaga datum detection,
+             NTv2 grid check, displaced-layer detection, default CRS mismatch).
+    1.0.0 - MVP: CRS (01-05), Layer (01-08), Project (01-07), Log (01-04).
+             Welcome screen, Copy for AI.
