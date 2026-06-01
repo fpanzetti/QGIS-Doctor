@@ -1,7 +1,8 @@
 """
 QGIS Doctor — Diagnostics Engine (v0.1 MVP).
 
-Moduli implementati: CRS-01..05, LAY-01..08, PRJ-01..07, LOG-01..04.
+Moduli implementati: CRS-01..08, LAY-01..08, LAY-11, LAY-13..14,
+                     PRJ-01..08, LOG-01..04, GPK-01..02.
 Ogni check è isolato in try/except per non bloccare l'analisi in caso di errore.
 """
 
@@ -64,6 +65,7 @@ class DiagnosticsEngine:
             ("CRS",         lambda: self._check_crs(project, layers)),
             ("Layers",      lambda: self._check_layers(layers)),
             ("Project",     lambda: self._check_project(project, layers)),
+            ("GeoPackage",  lambda: self._check_geopackage(project, layers)),
             ("Log",         lambda: self._check_log()),
             ("Joins",       lambda: self._check_joins(project, layers)),
             ("Plugins",     lambda: self._check_plugins(project)),
@@ -1112,6 +1114,12 @@ class DiagnosticsEngine:
             except Exception:
                 pass
 
+        # LAY-14: layer registrati nel progetto ma assenti dal layer tree
+        try:
+            self._lay14_missing_from_tree(layers)
+        except Exception:
+            pass
+
     def _lay01_invalid(self, layer):
         if not layer.isValid():
             source = layer.source()
@@ -1345,6 +1353,7 @@ class DiagnosticsEngine:
             lambda: self._prj05_no_ellipsoid(project),
             lambda: self._prj06_many_layers(layers),
             lambda: self._prj07_custom_vars(project),
+            lambda: self._prj08_canvas_too_small(project, layers),
         ]:
             try:
                 check()
@@ -1501,6 +1510,439 @@ class DiagnosticsEngine:
                     ),
                     technical_detail=f"custom variables: {custom}",
                 ))
+        except Exception:
+            pass
+
+    def _prj08_canvas_too_small(self, project, layers):
+        """
+        PRJ-08: il canvas è salvato con un'estensione sospettosamente piccola rispetto
+        all'extent reale dei layer. All'apertura del progetto il canvas mostra un'area
+        microscopica, rendendo praticamente invisibili tutti i layer.
+
+        Caso reale: project salvato dopo uno "zoom alla feature" su un poligono di 2 m²
+        (tomba in uno scavo archeologico) — il canvas era 42×74 m su un corridoio di 20 km.
+        """
+        if not _HAS_QGIS:
+            return
+
+        try:
+            canvas = self.iface.mapCanvas() if self.iface else None
+            if canvas is None:
+                return
+            canvas_extent = canvas.extent()
+            if canvas_extent.isNull() or canvas_extent.isEmpty():
+                return
+
+            canvas_area = canvas_extent.width() * canvas_extent.height()
+            # Calcola l'extent complessivo di tutti i layer vettoriali validi
+            # nel CRS del progetto (QGIS li riproietta automaticamente)
+            from qgis.core import QgsCoordinateTransform
+            project_crs = project.crs()
+            total_xmin, total_ymin = float("inf"), float("inf")
+            total_xmax, total_ymax = float("-inf"), float("-inf")
+            valid_extents = 0
+
+            for layer in layers:
+                if not layer.isValid():
+                    continue
+                if not hasattr(layer, "featureCount"):
+                    continue  # raster e tile layers: skip
+                try:
+                    extent = layer.extent()
+                    if extent.isNull() or extent.isEmpty():
+                        continue
+                    # Verifica che l'extent non contenga inf/nan
+                    import math
+                    if not all(math.isfinite(v) for v in [
+                        extent.xMinimum(), extent.xMaximum(),
+                        extent.yMinimum(), extent.yMaximum()
+                    ]):
+                        continue
+                    # Riproietta al CRS del progetto
+                    if layer.crs().isValid() and project_crs.isValid():
+                        tr = QgsCoordinateTransform(layer.crs(), project_crs, project)
+                        extent = tr.transformBoundingBox(extent)
+                    total_xmin = min(total_xmin, extent.xMinimum())
+                    total_ymin = min(total_ymin, extent.yMinimum())
+                    total_xmax = max(total_xmax, extent.xMaximum())
+                    total_ymax = max(total_ymax, extent.yMaximum())
+                    valid_extents += 1
+                except Exception:
+                    continue
+
+            if valid_extents == 0 or total_xmax <= total_xmin or total_ymax <= total_ymin:
+                return
+
+            layers_area = (total_xmax - total_xmin) * (total_ymax - total_ymin)
+            if layers_area <= 0:
+                return
+
+            ratio = canvas_area / layers_area
+
+            # Segnala se il canvas mostra meno dello 0.5% dell'extent totale dei layer
+            if ratio < 0.005:
+                canvas_w = canvas_extent.width()
+                canvas_h = canvas_extent.height()
+                layers_w = total_xmax - total_xmin
+                layers_h = total_ymax - total_ymin
+
+                # Unità di misura
+                units = project_crs.mapUnits()
+                unit_label = "m" if units == 0 else "°" if units == 6 else "unità"
+
+                self.issues.append(DiagnosticIssue(
+                    id="PRJ-08",
+                    category="Project",
+                    issue_type="user_error",
+                    severity="WARNING",
+                    title="Canvas salvato su un'area troppo piccola — i layer sembrano spariti",
+                    explanation=(
+                        f"Il progetto è stato salvato con il canvas ingrandito su un'area "
+                        f"di soli {canvas_w:.1f} × {canvas_h:.1f} {unit_label}, mentre "
+                        f"i layer coprono complessivamente {layers_w:.0f} × {layers_h:.0f} {unit_label}. "
+                        f"Il canvas visualizza {ratio*100:.3f}% dell'area totale.\n\n"
+                        "All'apertura del progetto la mappa appare bianca o vuota: i layer "
+                        "ci sono tutti, ma si trovano fuori dalla piccola finestra visibile. "
+                        "Questo accade tipicamente dopo uno 'zoom alla feature' su una feature "
+                        "molto piccola (es. un punto o un poligono di pochi metri quadri) "
+                        "seguito dal salvataggio del progetto."
+                    ),
+                    suggestion=(
+                        "Per tornare a vedere tutti i layer:\n"
+                        "  • Ctrl+Shift+F  oppure  Visualizza → Zoom sull'estensione del progetto\n"
+                        "  • oppure: tasto destro su un layer → Zoom al layer\n\n"
+                        "Per evitare che si ripeta:\n"
+                        "  Prima di salvare il progetto, assicurati di avere una vista "
+                        "completa sull'area di lavoro, non ingrandita su una singola feature."
+                    ),
+                    technical_detail=(
+                        f"Canvas extent: {canvas_extent.toString()}\n"
+                        f"Canvas area: {canvas_area:.1f} {unit_label}²\n"
+                        f"Layer total extent: ({total_xmin:.1f},{total_ymin:.1f}) → "
+                        f"({total_xmax:.1f},{total_ymax:.1f})\n"
+                        f"Layers area: {layers_area:.1f} {unit_label}²\n"
+                        f"Ratio: {ratio*100:.4f}%"
+                    ),
+                ))
+        except Exception:
+            pass
+
+    def _lay14_missing_from_tree(self, layers):
+        """
+        LAY-14: layer registrati nel progetto ma assenti dal layer tree (pannello Layer).
+        Causa comune: QFieldSync riscrive il layer tree alla sincronizzazione,
+        mantenendo solo i layer esplicitamente inclusi nel profilo QField e
+        scartando silenziosamente tutti gli altri.
+        Effetto: i layer "scomparsi" non vengono renderizzati né mostrati nel pannello,
+        anche se le loro definizioni (simbologia, CRS, datasource) sono intatte nel .qgs.
+
+        Caso reale: 41 layer su 43 rimossi dal tree dopo una sincronizzazione QFieldCloud,
+        inclusi Google Satellite, tutti i layer WMS e l'intero template GNA.
+        """
+        if not _HAS_QGIS:
+            return
+        try:
+            project = QgsProject.instance()
+            root = project.layerTreeRoot()
+            if root is None:
+                return
+
+            # ID dei layer presenti nel tree (ricerca ricorsiva)
+            tree_layer_ids = {
+                tl.layerId()
+                for tl in root.findLayers()
+            }
+
+            # Tutti i layer registrati nel progetto
+            registered = project.mapLayers()
+
+            missing = {
+                lid: lyr
+                for lid, lyr in registered.items()
+                if lid not in tree_layer_ids
+            }
+
+            if not missing:
+                return
+
+            missing_names = sorted(lyr.name() for lyr in missing.values())
+            n = len(missing)
+
+            self.issues.append(DiagnosticIssue(
+                id="LAY-14",
+                category="Layers",
+                issue_type="known_bug",
+                severity="ERROR",
+                title=f"{n} layer registrati nel progetto ma assenti dal pannello Layer",
+                explanation=(
+                    f"{n} layer sono definiti nel progetto (con simbologia, CRS e "
+                    f"datasource intatti) ma non compaiono nel pannello Layer e non "
+                    f"vengono visualizzati sulla mappa:\n"
+                    + "\n".join(f"  • {name}" for name in missing_names[:15])
+                    + (f"\n  … e altri {n - 15}" if n > 15 else "")
+                    + "\n\n"
+                    "Causa più comune: QFieldSync (o QField Cloud) riscrive il layer tree "
+                    "durante la sincronizzazione, mantenendo solo i layer inclusi nel "
+                    "profilo QField. Layer di sfondo (Google Satellite, WMS, OSM), "
+                    "layer di riferimento e template vengono rimossi silenziosamente.\n\n"
+                    "I dati sono intatti — il problema è solo nella struttura del progetto."
+                ),
+                suggestion=(
+                    "Per ripristinare i layer nel pannello:\n\n"
+                    "METODO 1 — Trascina nel pannello (per pochi layer):\n"
+                    "  Pannello Layer → tasto destro → Aggiungi layer esistente\n"
+                    "  I layer sono già nel progetto, basta renderli visibili.\n\n"
+                    "METODO 2 — Ricostruisci il layer tree dal file di progetto:\n"
+                    "  Il file .qgs/.qgz contiene tutte le definizioni. Puoi usare\n"
+                    "  QGIS Doctor → Fix automatico (se disponibile) oppure aprire\n"
+                    "  il file in un editor XML e riaggiungere i layer al blocco\n"
+                    "  <layer-tree-group>.\n\n"
+                    "METODO 3 — Prevenzione con QFieldSync:\n"
+                    "  In QFieldSync → Configurazione progetto → assicurati che i layer\n"
+                    "  di sfondo siano marcati come 'Base layer' o 'Read only' e\n"
+                    "  inclusi esplicitamente nel profilo di sincronizzazione."
+                ),
+                technical_detail=(
+                    f"Layer registrati: {len(registered)}\n"
+                    f"Layer nel tree: {len(tree_layer_ids)}\n"
+                    f"Layer mancanti: {n}\n"
+                    f"IDs mancanti: {', '.join(sorted(missing.keys())[:5])}"
+                    + (" ..." if n > 5 else "")
+                ),
+                auto_fixable=False,
+            ))
+        except Exception:
+            pass
+
+    # ── MODULO GeoPackage (GPK-01..02) ────────────────────────────────────────
+
+    def _check_geopackage(self, project, layers):
+        """
+        Controlli specifici per i layer GeoPackage (GPKG).
+        Questi problemi non emergono dai metadati QGIS ma richiedono
+        l'ispezione diretta del database SQLite sottostante.
+        """
+        for layer in layers:
+            try:
+                self._gpk01_inf_geometry(layer)
+            except Exception:
+                pass
+            try:
+                self._gpk02_extent_mismatch(layer)
+            except Exception:
+                pass
+
+    def _gpk01_inf_geometry(self, layer):
+        """
+        GPK-01: feature con coordinate infinite (inf/nan) nell'indice spaziale R-tree
+        del GeoPackage. Queste feature appaiono nella tabella attributi ma non sulla
+        mappa, e — cosa più grave — corrompono l'extent del layer: QGIS calcola
+        un bounding box infinito, lo "zoom al layer" manda la vista a una posizione
+        indefinita, e a volte l'intero layer smette di renderizzarsi.
+
+        Causa tipica: feature create in QField con un poligono vuoto (ad es. record
+        aggiunti tramite il modulo senza disegnare la geometria) o bug di importazione
+        KML/GPX con coordinate non valide.
+
+        Rilevamento: query diretta sulla tabella rtree_<layer>_<geom> del GPKG SQLite.
+        """
+        if not _HAS_QGIS:
+            return
+        if not isinstance(layer, QgsVectorLayer):
+            return
+
+        source = layer.source()
+        if not source or ".gpkg" not in source.lower():
+            return
+
+        # Estrai percorso file e nome layer dal source string
+        # Formato: /path/to/file.gpkg|layername=NomeLayer
+        parts = source.split("|")
+        gpkg_path = parts[0].strip()
+        layer_name_in_gpkg = None
+        for part in parts[1:]:
+            if part.strip().startswith("layername="):
+                layer_name_in_gpkg = part.strip()[len("layername="):]
+                break
+        if not layer_name_in_gpkg:
+            return
+        if not os.path.isfile(gpkg_path):
+            return
+
+        try:
+            import sqlite3
+            import math
+
+            conn = sqlite3.connect(gpkg_path)
+            cur = conn.cursor()
+
+            # Trova il nome della colonna geometria
+            cur.execute(
+                "SELECT column_name FROM gpkg_geometry_columns WHERE table_name=?",
+                (layer_name_in_gpkg,)
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.close()
+                return
+            geom_col = row[0]
+            rtree_table = f"rtree_{layer_name_in_gpkg}_{geom_col}"
+
+            # Verifica che la tabella rtree esista
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (rtree_table,)
+            )
+            if not cur.fetchone():
+                conn.close()
+                return
+
+            # Conta le feature con coordinate infinite o NaN nell'rtree
+            cur.execute(
+                f"SELECT id, minx, maxx, miny, maxy FROM \"{rtree_table}\" "
+                f"WHERE minx > 1e30 OR maxx > 1e30 OR miny > 1e30 OR maxy > 1e30 "
+                f"OR minx != minx OR maxx != maxx OR miny != miny OR maxy != maxy"
+            )
+            bad_rows = cur.fetchall()
+            conn.close()
+
+            if not bad_rows:
+                return
+
+            n = len(bad_rows)
+            bad_ids = [str(r[0]) for r in bad_rows[:5]]
+
+            self.issues.append(DiagnosticIssue(
+                id="GPK-01",
+                category="GeoPackage",
+                issue_type="known_bug",
+                severity="ERROR",
+                title=f"GeoPackage — {n} feature con geometria infinita (inf/nan) nel layer \"{layer.name()}\"",
+                explanation=(
+                    f"Il layer \"{layer.name()}\" contiene {n} feature con coordinate "
+                    f"infinite (inf) o non valide (NaN) nell'indice spaziale R-tree del "
+                    f"GeoPackage. Questi record:\n"
+                    "  • Compaiono nella tabella attributi\n"
+                    "  • Non appaiono sulla mappa (nessuna geometria da disegnare)\n"
+                    "  • Corrompono l'extent del layer: QGIS calcola una bounding box "
+                    "infinita, rendendo inutilizzabile lo 'zoom al layer'\n"
+                    "  • In alcuni casi impediscono il rendering dell'intero layer\n\n"
+                    "Cause tipiche:\n"
+                    "  • Feature create in QField tramite form senza disegnare la geometria\n"
+                    "  • Importazione da KML/GPX con coordinate mancanti\n"
+                    "  • Record duplicati da un import parziale\n\n"
+                    f"Feature coinvolte (FID): {', '.join(bad_ids)}"
+                    + (f" e altre {n - 5}" if n > 5 else "")
+                ),
+                suggestion=(
+                    "SOLUZIONE 1 — Correggi la geometria in QGIS (consigliata):\n"
+                    "  1. Apri la tabella attributi del layer\n"
+                    "  2. Filtra le feature senza geometria:\n"
+                    "     Seleziona per espressione → is_empty($geometry) OR $geometry IS NULL\n"
+                    "  3. Decide se eliminarle o aggiungere la geometria corretta\n"
+                    "  4. Salva le modifiche del layer\n\n"
+                    "SOLUZIONE 2 — Correggi direttamente nel GeoPackage (avanzata):\n"
+                    "  Con un editor SQLite (es. DB Browser for SQLite):\n"
+                    f"  UPDATE \"{layer_name_in_gpkg}\" SET {geom_col} = NULL\n"
+                    f"  WHERE fid IN ({', '.join(bad_ids)});\n"
+                    "  Poi esegui: VACUUM; per ricostruire l'indice.\n\n"
+                    "Dopo la correzione usa 'Zoom al layer' — funzionerà correttamente."
+                ),
+                technical_detail=(
+                    f"File: {gpkg_path}\n"
+                    f"Tabella: {layer_name_in_gpkg}\n"
+                    f"R-tree: {rtree_table}\n"
+                    f"Feature con inf/nan: {n}\n"
+                    f"FID coinvolti: {', '.join(bad_ids)}"
+                    + (" ..." if n > 5 else "")
+                ),
+                layer_name=layer.name(),
+                auto_fixable=False,
+            ))
+
+        except Exception:
+            pass
+
+    def _gpk02_extent_mismatch(self, layer):
+        """
+        GPK-02: l'extent dichiarato in gpkg_contents non corrisponde all'extent reale
+        dei dati. Questo può causare problemi di rendering e zoom errati.
+
+        Causa tipica: modifiche manuali al database senza aggiornare i metadati,
+        o una sincronizzazione QFieldSync che non ricalcola l'extent dopo le modifiche.
+        """
+        if not _HAS_QGIS:
+            return
+        if not isinstance(layer, QgsVectorLayer):
+            return
+
+        source = layer.source()
+        if not source or ".gpkg" not in source.lower():
+            return
+
+        parts = source.split("|")
+        gpkg_path = parts[0].strip()
+        layer_name_in_gpkg = None
+        for part in parts[1:]:
+            if part.strip().startswith("layername="):
+                layer_name_in_gpkg = part.strip()[len("layername="):]
+                break
+        if not layer_name_in_gpkg:
+            return
+        if not os.path.isfile(gpkg_path):
+            return
+
+        try:
+            import sqlite3
+            import math
+
+            conn = sqlite3.connect(gpkg_path)
+            cur = conn.cursor()
+
+            cur.execute(
+                "SELECT min_x, min_y, max_x, max_y FROM gpkg_contents WHERE table_name=?",
+                (layer_name_in_gpkg,)
+            )
+            row = cur.fetchone()
+            conn.close()
+
+            if not row:
+                return
+            meta_xmin, meta_ymin, meta_xmax, meta_ymax = row
+
+            # Controlla se i valori in gpkg_contents contengono inf/nan
+            if not all(
+                v is not None and math.isfinite(float(v))
+                for v in [meta_xmin, meta_ymin, meta_xmax, meta_ymax]
+            ):
+                self.issues.append(DiagnosticIssue(
+                    id="GPK-02",
+                    category="GeoPackage",
+                    issue_type="known_bug",
+                    severity="WARNING",
+                    title=f"GeoPackage — extent non valido in gpkg_contents per \"{layer.name()}\"",
+                    explanation=(
+                        f"I metadati di extent del layer \"{layer.name()}\" in gpkg_contents "
+                        f"contengono valori non validi (inf o NULL): "
+                        f"min_x={meta_xmin}, min_y={meta_ymin}, "
+                        f"max_x={meta_xmax}, max_y={meta_ymax}.\n\n"
+                        "Questo può causare comportamenti errati nello zoom, nel rendering "
+                        "e nella sincronizzazione con QField."
+                    ),
+                    suggestion=(
+                        "Ricalcola l'extent del layer:\n"
+                        "  In QGIS: Processing → Strumenti vettore → Estrai extent layer\n"
+                        "  oppure con DB Browser for SQLite aggiorna manualmente gpkg_contents."
+                    ),
+                    technical_detail=(
+                        f"File: {gpkg_path}\n"
+                        f"gpkg_contents per '{layer_name_in_gpkg}': "
+                        f"min_x={meta_xmin}, min_y={meta_ymin}, "
+                        f"max_x={meta_xmax}, max_y={meta_ymax}"
+                    ),
+                    layer_name=layer.name(),
+                ))
+
         except Exception:
             pass
 
